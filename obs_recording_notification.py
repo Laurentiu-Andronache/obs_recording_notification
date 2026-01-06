@@ -12,14 +12,30 @@ except ImportError:
 # --------------------------------------------------
 
 class Config:
+    """Runtime configuration for notification behavior.
+
+    These class attributes are modified by OBS script settings via script_update().
+    """
+
     sounds_enabled = True
     position_center = True  # True=center, False=top-right
 
 
 def _play_sound_thread(alias, fallback_freq, fallback_duration, fallback_count):
-    """Internal: play sound in separate thread to avoid OBS audio conflicts."""
+    """Play Windows system sound synchronously in a background thread.
+
+    Using SND_NODEFAULT ensures we fail explicitly if the alias is missing
+    from the Windows registry, rather than silently playing the default sound.
+    Fallback to Beep() provides audible feedback even on misconfigured systems.
+
+    Args:
+        alias: Windows sound alias (e.g., "DeviceConnect", "SystemHand").
+        fallback_freq: Beep frequency in Hz if alias fails.
+        fallback_duration: Beep duration in ms.
+        fallback_count: Number of fallback beeps to play.
+    """
     try:
-        winsound.PlaySound(alias, winsound.SND_ALIAS)  # Sync in thread ensures completion
+        winsound.PlaySound(alias, winsound.SND_ALIAS | winsound.SND_NODEFAULT)
     except:
         try:
             for _ in range(fallback_count):
@@ -29,16 +45,30 @@ def _play_sound_thread(alias, fallback_freq, fallback_duration, fallback_count):
 
 
 def _warmup_sound():
-    """Initialize Windows audio system by playing a silent sound."""
+    """Initialize Windows audio subsystem with inaudible beep.
+
+    PlaySound(None) is a no-op that doesn't actually initialize audio.
+    A real Beep call triggers the audio driver initialization, avoiding
+    ~100-500ms latency on the first notification sound.
+    """
     if SOUNDS_AVAILABLE:
         try:
-            winsound.PlaySound(None, winsound.SND_ASYNC)
+            winsound.Beep(37, 1)  # 37Hz for 1ms - inaudible
         except:
             pass
 
 
 def play_sound(alias, fallback_freq, fallback_duration, fallback_count=1):
-    """Play a Windows system sound with fallback beep(s)."""
+    """Play a Windows system sound asynchronously with fallback beeps.
+
+    Spawns a daemon thread to avoid blocking OBS. Respects Config.sounds_enabled.
+
+    Args:
+        alias: Windows sound alias from registry (e.g., "DeviceConnect").
+        fallback_freq: Beep frequency in Hz if alias lookup fails.
+        fallback_duration: Beep duration in ms.
+        fallback_count: Number of fallback beeps (default 1).
+    """
     if not SOUNDS_AVAILABLE or not Config.sounds_enabled:
         return
     threading.Thread(
@@ -49,7 +79,19 @@ def play_sound(alias, fallback_freq, fallback_duration, fallback_count=1):
 
 
 class Application(tk.Frame):
+    """Tkinter notification window with fade animations.
+
+    Displays recording/replay status with an indicator icon and text label.
+    Supports animation interrupts for rapid successive notifications.
+
+    Attributes:
+        is_animating: Whether a fade animation is currently running.
+        pending_notification: Flag to interrupt current animation for new notification.
+        scale: UI scale factor based on screen resolution (1.0 at 1080p).
+    """
+
     def __init__(self, master=None):
+        """Initialize the notification window with scaled UI components."""
         tk.Frame.__init__(self, master)
         self.config(bg="#1a1a1a")
         self.pack()
@@ -130,6 +172,7 @@ class Application(tk.Frame):
 
 
     def fade_in(self):
+        """Animate window opacity from 0 to 0.9, then schedule fade_out."""
         current = float(self.master.attributes('-alpha'))
         if current < 0.9:
             current += 0.1
@@ -139,6 +182,7 @@ class Application(tk.Frame):
             self._fadeout_timer = self.after(3000, self.fade_out)  # Stay visible for 3 seconds
 
     def fade_out(self):
+        """Animate window opacity from current to 0, then clear notification state."""
         current = float(self.master.attributes('-alpha'))
         if current > 0.1:
             current -= 0.1
@@ -151,8 +195,13 @@ class Application(tk.Frame):
                 delattr(self, 'notification_type')
                 delattr(self, 'notification_state')
 
-
     def check_loop_status(self):
+        """Poll for pending notifications and trigger animations.
+
+        Runs in a 100ms polling loop. When notification_type/state are set,
+        updates the UI and starts fade_in. Interrupts current animation if
+        pending_notification is True.
+        """
         if not hasattr(self, 'notification_type'):
             self.after(100, self.check_loop_status)
             return
@@ -191,10 +240,15 @@ class Application(tk.Frame):
 # Global reference to application instance
 app_instance = None
 
-def runtk():  # runs in background thread
+def runtk():
+    """Run the Tkinter main loop in a background thread.
+
+    Creates the Application instance, starts the notification polling loop,
+    and runs mainloop(). Clears app_instance on window close.
+    """
     global app_instance
-    app_instance = Application()                        
-    app_instance.master.title('OBS Recording Notification')  
+    app_instance = Application()
+    app_instance.master.title('OBS Recording Notification')
     app_instance.check_loop_status()
     app_instance.mainloop()
     app_instance = None  # Clear reference when window closes
@@ -208,6 +262,14 @@ thd.daemon = True  # background thread will exit if main thread exits
 # ----------------------------   OBS script    ------------------------------------------------------------
 
 def frontend_event_handler(data):
+    """Handle OBS frontend events and trigger notifications.
+
+    Responds to recording start/stop/pause/resume and replay buffer events.
+    Plays sounds and updates the notification window via thread-safe after() calls.
+
+    Args:
+        data: OBS frontend event constant (e.g., OBS_FRONTEND_EVENT_RECORDING_STARTING).
+    """
     global app_instance
 
     if data == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING:
@@ -267,6 +329,7 @@ def frontend_event_handler(data):
 
 
 def script_description():
+    """Return the description shown in OBS Scripts dialog."""
     return ("OBS Shadowplay-style Notification\n\n"
             "Shows visual + audio notifications for:\n"
             "• Recording Start/Stop/Pause/Resume\n"
@@ -279,11 +342,13 @@ def script_description():
 
 
 def script_defaults(settings):
+    """Set default values for script properties."""
     obs.obs_data_set_default_bool(settings, "sounds_enabled", True)
     obs.obs_data_set_default_bool(settings, "position_center", True)
 
 
 def script_properties():
+    """Create the properties UI shown in OBS Scripts dialog."""
     props = obs.obs_properties_create()
     obs.obs_properties_add_bool(props, "sounds_enabled", "Enable sound notifications")
     obs.obs_properties_add_bool(props, "position_center", "Center notification (uncheck for top-right)")
@@ -291,6 +356,7 @@ def script_properties():
 
 
 def script_update(settings):
+    """Apply settings changes from OBS Scripts dialog to Config."""
     Config.sounds_enabled = obs.obs_data_get_bool(settings, "sounds_enabled")
     Config.position_center = obs.obs_data_get_bool(settings, "position_center")
     if app_instance and hasattr(app_instance, 'master') and app_instance.master.winfo_exists():
